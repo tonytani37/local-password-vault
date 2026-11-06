@@ -17,7 +17,7 @@
 | 項目 | 内容 |
 |---|---|
 | 実行環境 | Node.js 22.13 以上（`node:sqlite` を使用） |
-| 依存パッケージ | hono、@hono/node-server、csv-parser |
+| 依存パッケージ | hono、@hono/node-server、csv-parser (esbuild によるスタンドアロンバンドル)|
 | データベース | SQLite（Node.js組み込みの `node:sqlite`） |
 | 待受 | 127.0.0.1:3000（ローカルのみ） |
 | クライアント | Webブラウザ（Chrome等） |
@@ -28,7 +28,7 @@
 root\
   start.bat          起動用バッチ(Windows版　macOS,Linux版はstart.sh)
   node.exe           Node.js 本体
-  server.mjs         サーバー本体
+  server.mjs         サーバー本体（esbuild によるスタンドアロンバンドル）
   package.json
   public\index.html  画面
   vault.db           SQLiteデータベース（初回起動時に自動作成）
@@ -173,4 +173,4 @@ root\
 
 | 版 | 日付 | 内容 |
 |---|---|---|
-| 1.0 | 2026-11-06 | 初版（セッション認証、全項目暗号化、タブ画面、CSVインポート結果表示、バックアップ世代管理） |
+| 1.0 | 2026-11-06 | 初版（セッション認証、全項目暗号化、タブ画面、CSVインポート結果表示、バックアップ世代管理）esbuild によるスタンドアロンバンドル |
