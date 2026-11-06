@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local Password Vault</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; max-width: 960px; margin: 32px auto; padding: 0 20px; color: #333; }
+    .hidden { display: none; }
+    .card { border: 1px solid #ddd; padding: 24px; border-radius: 8px; margin-bottom: 24px; background-color: #fafafa; }
+    input[type="password"], input[type="text"], input[type="url"], input[type="file"] {
+      width: 100%; padding: 10px; margin: 6px 0 16px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px;
+    }
+    button { padding: 10px 20px; background-color: #0066cc; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+    button:hover { background-color: #0052a3; }
+    button.secondary { background-color: #666; }
+    button.secondary:hover { background-color: #444; }
+    button.small { padding: 3px 9px; font-size: 12px; }
+    button.danger { background-color: #c62828; }
+    button.danger:hover { background-color: #8e0000; }
+    .msg-error { color: #d32f2f; margin-top: 8px; }
+    .msg-success { color: #388e3c; margin-top: 8px; }
+    .form-group { margin-bottom: 12px; }
+    code { word-break: break-all; }
+
+    /* タブ */
+    .tabs { display: flex; align-items: flex-end; gap: 4px; border-bottom: 2px solid #ddd; margin-bottom: 20px; }
+    .tab-btn { background-color: #e8e8e8; color: #333; border-radius: 6px 6px 0 0; }
+    .tab-btn:hover { background-color: #d8d8d8; }
+    .tab-btn.active, .tab-btn.active:hover { background-color: #0066cc; color: #fff; }
+    .tabs .spacer { flex: 1; }
+    .tabs .logout { margin-bottom: 4px; }
+
+    /* 一覧（コンパクト表示） */
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; background: #fff; table-layout: fixed; }
+    th, td { border: 1px solid #eee; padding: 5px 8px; text-align: left; vertical-align: middle; line-height: 1.3; }
+    th { background-color: #f0f0f0; }
+    td .title { display: block; font-weight: bold; overflow-wrap: anywhere; }
+    td .url { display: block; margin-top: 1px; font-size: 12px; color: #666; overflow-wrap: anywhere; }
+    td .url a { color: #0066cc; text-decoration: none; }
+    td .url a:hover { text-decoration: underline; }
+    .user-cell { overflow-wrap: anywhere; }
+    .pw-cell { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+    .pw-cell code { flex: 0 1 auto; margin-right: 4px; }
+    tr.new-row td { background-color: #fff8d6; }
+  </style>
+</head>
+<body>
+
+  <h2>パスワードマネージャー</h2>
+
+  <!-- 初期設定 -->
+  <div id="setupSection" class="card hidden">
+    <h3>マスターパスワードの初期設定</h3>
+    <p>このアプリケーションを保護するマスターパスワードを設定してください。忘れると保存データは復元できません。</p>
+    <form id="setupForm">
+      <label for="setupPassword">マスターパスワード (12文字以上):</label>
+      <input type="password" id="setupPassword" required minlength="12" autocomplete="new-password" placeholder="マスターパスワードを入力">
+      <button type="submit">初期設定を実行</button>
+    </form>
+    <p id="setupError" class="msg-error"></p>
+  </div>
+
+  <!-- ログイン -->
+  <div id="loginSection" class="card hidden">
+    <h3>ロック解除</h3>
+    <form id="loginForm">
+      <input type="text" name="username" value="vault-master-user" autocomplete="username" style="display:none;" />
+      <label for="masterPassword">マスターパスワード:</label>
+      <input type="password" id="masterPassword" name="password" autocomplete="current-password" required placeholder="マスターパスワードを入力">
+      <button type="submit">ロック解除</button>
+    </form>
+    <p id="loginError" class="msg-error"></p>
+  </div>
+
+  <!-- メイン（タブ） -->
+  <div id="vaultSection" class="card hidden">
+    <div class="tabs">
+      <button type="button" class="tab-btn active" id="tabListBtn" data-tab="list">登録済み一覧</button>
+      <button type="button" class="tab-btn" id="tabAddBtn" data-tab="add">新規登録</button>
+      <span class="spacer"></span>
+      <button type="button" id="logoutBtn" class="secondary small logout">再ロック（ログアウト）</button>
+    </div>
+
+    <!-- タブ1: 登録済み一覧・検索 -->
+    <div id="tabList">
+      <input type="text" id="searchBox" autocomplete="off" placeholder="タイトル・URL・ユーザー名で検索" style="margin-bottom: 6px;">
+      <p id="countLabel" style="margin: 0 0 4px; color: #555;"></p>
+      <table id="vaultTable">
+        <colgroup>
+          <col style="width: 42%;">
+          <col style="width: 24%;">
+          <col style="width: 34%;">
+        </colgroup>
+        <thead>
+          <tr><th>タイトル / URL</th><th>ユーザー名</th><th>パスワード</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <!-- タブ2: 新規登録・CSVインポート -->
+    <div id="tabAdd" class="hidden">
+      <h3>新規アカウント追加</h3>
+      <form id="addForm">
+        <div class="form-group">
+          <label for="addTitle">タイトル (必須):</label>
+          <input type="text" id="addTitle" required placeholder="例: Google">
+        </div>
+        <div class="form-group">
+          <label for="addUrl">URL:</label>
+          <input type="url" id="addUrl" placeholder="例: https://accounts.google.com">
+        </div>
+        <div class="form-group">
+          <label for="addUsername">ユーザー名 / メールアドレス:</label>
+          <input type="text" id="addUsername" autocomplete="off" placeholder="例: user@example.com">
+        </div>
+        <div class="form-group">
+          <label for="addPassword">パスワード (必須):</label>
+          <input type="password" id="addPassword" required autocomplete="new-password" placeholder="暗号化保存するパスワード">
+        </div>
+        <button type="submit">暗号化して保存</button>
+      </form>
+      <p id="addMsg"></p>
+
+      <hr style="margin: 30px 0; border: 0; border-top: 1px solid #ddd;">
+
+      <h3>Chrome CSVパスワードインポート</h3>
+      <form id="importForm">
+        <input type="file" id="csvFile" accept=".csv" required>
+        <button type="submit" class="secondary">CSVインポート実行</button>
+      </form>
+      <p id="importMsg"></p>
+    </div>
+  </div>
+
+  <script>
+    // セッショントークンはメモリ上のみ（localStorage等には保存しない）
+    let token = null;
+    let allItems = [];
+    let highlightAfterId = null; // このIDより大きい行を「今回の取り込み分」として強調
+
+    const $ = (id) => document.getElementById(id);
+    const sections = { setup: $('setupSection'), login: $('loginSection'), vault: $('vaultSection') };
+
+    function show(name) {
+      for (const [k, el] of Object.entries(sections)) el.classList.toggle('hidden', k !== name);
+    }
+
+    // タブ切り替え
+    function showTab(name) {
+      $('tabList').classList.toggle('hidden', name !== 'list');
+      $('tabAdd').classList.toggle('hidden', name !== 'add');
+      $('tabListBtn').classList.toggle('active', name === 'list');
+      $('tabAddBtn').classList.toggle('active', name === 'add');
+    }
+    document.querySelectorAll('.tab-btn').forEach((b) =>
+      b.addEventListener('click', () => showTab(b.dataset.tab)));
+
+    async function api(path, { method = 'GET', body, form } = {}) {
+      const headers = {};
+      if (token) headers['Authorization'] = 'Bearer ' + token;
+      let payload;
+      if (form) {
+        payload = form;
+      } else if (body !== undefined) {
+        headers['Content-Type'] = 'application/json';
+        payload = JSON.stringify(body);
+      }
+      const res = await fetch(path, { method, headers, body: payload });
+      let data = {};
+      try { data = await res.json(); } catch {}
+      if (res.status === 401 && data.code === 'SESSION_EXPIRED') {
+        lock('セッションの有効期限が切れました。再度ログインしてください。');
+      }
+      return { ok: res.ok, status: res.status, data };
+    }
+
+    // 画面とメモリ上のデータを破棄してログイン画面へ
+    function lock(message = '') {
+      token = null;
+      allItems = [];
+      highlightAfterId = null;
+      $('searchBox').value = '';
+      $('countLabel').textContent = '';
+      $('addMsg').textContent = '';
+      $('importMsg').textContent = '';
+      $('vaultTable').querySelector('tbody').replaceChildren();
+      $('masterPassword').value = '';
+      $('loginError').textContent = message;
+      show('login');
+    }
+
+    // 起動時の初期化チェック
+    async function checkStatus() {
+      const { data } = await api('/api/status');
+      show(data.isInitialized ? 'login' : 'setup');
+    }
+    checkStatus();
+
+    // 初期設定
+    $('setupForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const masterPassword = $('setupPassword').value;
+      const { ok, data } = await api('/api/setup', { method: 'POST', body: { masterPassword } });
+      if (ok) {
+        $('setupPassword').value = '';
+        alert('初期設定が完了しました。ログインしてください。');
+        show('login');
+      } else {
+        $('setupError').textContent = data.error || 'エラーが発生しました。';
+      }
+    });
+
+    // ログイン
+    $('loginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const masterPassword = $('masterPassword').value;
+      const { ok, data } = await api('/api/login', { method: 'POST', body: { masterPassword } });
+      $('masterPassword').value = '';
+      if (ok) {
+        token = data.token;
+        $('loginError').textContent = '';
+        showTab('list');
+        show('vault');
+        await refreshList();
+      } else {
+        $('loginError').textContent = data.error || 'エラーが発生しました。';
+      }
+    });
+
+    // 新規登録
+    $('addForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const body = {
+        title: $('addTitle').value,
+        url: $('addUrl').value,
+        username: $('addUsername').value,
+        password: $('addPassword').value
+      };
+      const { ok, data } = await api('/api/credentials', { method: 'POST', body });
+      const addMsg = $('addMsg');
+      addMsg.className = ok ? 'msg-success' : 'msg-error';
+      addMsg.textContent = ok ? data.message : (data.error || 'エラーが発生しました。');
+      if (ok) {
+        $('addForm').reset();
+        refreshList();
+      }
+    });
+
+    // CSVインポート
+    $('importForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fileInput = $('csvFile');
+      const prevMaxId = allItems.reduce((m, it) => Math.max(m, it.id), 0);
+      const form = new FormData();
+      form.append('file', fileInput.files[0]);
+      const { ok, data } = await api('/api/import-csv', { method: 'POST', form });
+      const importMsg = $('importMsg');
+      importMsg.className = ok ? 'msg-success' : 'msg-error';
+      if (ok) {
+        const skipped = data.skipped ? `（パスワード空欄のためスキップ: ${data.skipped} 件）` : '';
+        importMsg.textContent = `${data.count} 件をインポートしました${skipped}。「登録済み一覧」タブの黄色い行が今回の取り込み分です。`;
+        fileInput.value = '';
+        highlightAfterId = prevMaxId;
+        $('searchBox').value = '';
+        refreshList();
+      } else {
+        importMsg.textContent = data.error || 'エラーが発生しました。';
+      }
+    });
+
+    async function refreshList() {
+      const { ok, data } = await api('/api/credentials');
+      if (ok) {
+        allItems = data.data;
+        applyFilter();
+      }
+    }
+
+    function applyFilter() {
+      const q = $('searchBox').value.trim().toLowerCase();
+      const items = q
+        ? allItems.filter((it) =>
+            [it.title, it.url, it.username].some((v) => (v || '').toLowerCase().includes(q)))
+        : allItems;
+      $('countLabel').textContent = q
+        ? `全 ${allItems.length} 件中 ${items.length} 件を表示`
+        : `全 ${allItems.length} 件`;
+      renderVault(items);
+    }
+    $('searchBox').addEventListener('input', applyFilter);
+
+    // http/https のURLのみリンク化（javascript: 等を防ぐ）
+    function safeHref(u) {
+      try {
+        const parsed = new URL(u);
+        return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.href : null;
+      } catch {
+        return null;
+      }
+    }
+
+    function makeButton(label, onClick, extraClass = '') {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'small ' + extraClass;
+      b.textContent = label;
+      b.addEventListener('click', onClick);
+      return b;
+    }
+
+    let clipboardTimer = null;
+
+    function renderVault(items) {
+      const tbody = $('vaultTable').querySelector('tbody');
+      tbody.replaceChildren();
+      if (items.length === 0) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 3;
+        td.textContent = 'データが存在しません。';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+      }
+
+      for (const item of items) {
+        const tr = document.createElement('tr');
+        if (highlightAfterId !== null && item.id > highlightAfterId) tr.className = 'new-row';
+
+        // タイトル + URL（textContentで挿入するのでHTMLとして解釈されない）
+        const tdTitle = document.createElement('td');
+        const title = document.createElement('span');
+        title.className = 'title';
+        title.textContent = item.title;
+        tdTitle.appendChild(title);
+        if (item.url) {
+          const urlLine = document.createElement('span');
+          urlLine.className = 'url';
+          const href = safeHref(item.url);
+          if (href) {
+            const a = document.createElement('a');
+            a.href = href;
+            a.target = '_blank';
+            a.rel = 'noopener noreferrer';
+            a.textContent = item.url;
+            urlLine.appendChild(a);
+          } else {
+            urlLine.textContent = item.url;
+          }
+          tdTitle.appendChild(urlLine);
+        }
+
+        const tdUser = document.createElement('td');
+        tdUser.className = 'user-cell';
+        tdUser.textContent = item.username || '-';
+
+        // パスワード（通常はマスク表示。ボタンは同じ行に並べる）
+        const tdPw = document.createElement('td');
+        const wrap = document.createElement('div');
+        wrap.className = 'pw-cell';
+        const code = document.createElement('code');
+        const MASK = '••••••••';
+        let visible = false;
+        code.textContent = MASK;
+
+        const toggleBtn = makeButton('表示', () => {
+          visible = !visible;
+          code.textContent = visible ? item.password : MASK;
+          toggleBtn.textContent = visible ? '隠す' : '表示';
+        }, 'secondary');
+
+        const copyBtn = makeButton('コピー', async () => {
+          try {
+            await navigator.clipboard.writeText(item.password);
+            copyBtn.textContent = 'コピー済み';
+            clearTimeout(clipboardTimer);
+            clipboardTimer = setTimeout(() => navigator.clipboard.writeText('').catch(() => {}), 30000);
+            setTimeout(() => (copyBtn.textContent = 'コピー'), 1500);
+          } catch {
+            alert('クリップボードにコピーできませんでした。');
+          }
+        }, 'secondary');
+
+        const delBtn = makeButton('削除', async () => {
+          if (!confirm(`「${item.title}」を削除しますか？`)) return;
+          const { ok, data } = await api('/api/credentials/' + item.id, { method: 'DELETE' });
+          if (ok) refreshList(); else alert(data.error || '削除に失敗しました。');
+        }, 'danger');
+
+        wrap.append(code, toggleBtn, copyBtn, delBtn);
+        tdPw.appendChild(wrap);
+        tr.append(tdTitle, tdUser, tdPw);
+        tbody.appendChild(tr);
+      }
+    }
+
+    // ログアウト
+    $('logoutBtn').addEventListener('click', async () => {
+      await api('/api/logout', { method: 'POST' });
+      lock('');
+    });
+  </script>
+</body>
+</html>

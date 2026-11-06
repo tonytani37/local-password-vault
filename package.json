@@ -1,0 +1,16 @@
+{
+  "name": "local-password-vault",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.6",
+    "csv-parser": "^3.2.1",
+    "hono": "^4.13.16"
+  }
+}
