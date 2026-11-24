@@ -3667,12 +3667,12 @@ function insertCredential(stmt, record, key) {
   return stmt.run(iv, authTag, data);
 }
 function listCredentials(key) {
-  const rows = db.prepare("SELECT id, iv, auth_tag, data FROM credentials ORDER BY id DESC").all();
+  const rows = db.prepare("SELECT id, iv, auth_tag, data, created_at FROM credentials ORDER BY id DESC").all();
   return rows.map((row) => {
     try {
-      return { id: Number(row.id), ...decryptRecord(row, key) };
+      return { id: Number(row.id), created_at: row.created_at, ...decryptRecord(row, key) };
     } catch {
-      return { id: Number(row.id), title: "(\u5FA9\u53F7\u306B\u5931\u6557\u3057\u307E\u3057\u305F)", url: "", username: "", password: "" };
+      return { id: Number(row.id), created_at: row.created_at, title: "(\u5FA9\u53F7\u306B\u5931\u6557\u3057\u307E\u3057\u305F)", url: "", username: "", password: "" };
     }
   });
 }
