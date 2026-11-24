@@ -3469,8 +3469,8 @@ var import_csv_parser = __toESM(require_csv_parser(), 1);
 var PORT = 3e3;
 var HOST = "127.0.0.1";
 var __dirname = path.dirname(fileURLToPath(import.meta.url));
-var DB_FILE = path.join(__dirname, "vault.db");
-var BACKUP_DIR = path.join(__dirname, "backups");
+var DB_FILE = process.env.VAULT_DB_PATH || path.join(__dirname, "vault.db");
+var BACKUP_DIR = process.env.VAULT_BACKUP_DIR || path.join(__dirname, "backups");
 var MAX_BACKUPS = 10;
 var SESSION_TTL_MS = 10 * 60 * 1e3;
 var MIN_PASSWORD_LENGTH = 12;
@@ -3481,6 +3481,127 @@ var KDF = { iterations: 21e4, digest: "sha512" };
 var ALLOWED_HOSTS = /* @__PURE__ */ new Set([`127.0.0.1:${PORT}`, `localhost:${PORT}`]);
 var ALLOWED_ORIGINS = /* @__PURE__ */ new Set([`http://127.0.0.1:${PORT}`, `http://localhost:${PORT}`]);
 fs.mkdirSync(BACKUP_DIR, { recursive: true });
+fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
+var R2_CONFIG = {
+  accountId: process.env.R2_ACCOUNT_ID || "",
+  bucket: process.env.R2_BUCKET || "",
+  accessKeyId: process.env.R2_ACCESS_KEY_ID || "",
+  secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || "",
+  key: process.env.R2_OBJECT_KEY || "vault.db"
+};
+var isR2Enabled = !!(R2_CONFIG.accountId && R2_CONFIG.bucket && R2_CONFIG.accessKeyId && R2_CONFIG.secretAccessKey);
+var currentETag = null;
+var isReadOnly = false;
+function hmacSha256(key, data, encoding) {
+  return crypto2.createHmac("sha256", key).update(data).digest(encoding);
+}
+function sha256Hex(data) {
+  return crypto2.createHash("sha256").update(data).digest("hex");
+}
+function signR2Request(method, bodyBuffer = null, extraHeaders = {}) {
+  const host = `${R2_CONFIG.accountId}.r2.cloudflarestorage.com`;
+  const canonicalUri = `/${R2_CONFIG.bucket}/${R2_CONFIG.key}`;
+  const url = `https://${host}${canonicalUri}`;
+  const now = /* @__PURE__ */ new Date();
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
+  const dateStamp = amzDate.slice(0, 8);
+  const region = "auto";
+  const service = "s3";
+  const payloadHash = bodyBuffer ? sha256Hex(bodyBuffer) : sha256Hex("");
+  const headers = {
+    host,
+    "x-amz-content-sha256": payloadHash,
+    "x-amz-date": amzDate,
+    ...extraHeaders
+  };
+  const sortedKeys = Object.keys(headers).map((k) => k.toLowerCase()).sort();
+  const canonicalHeaders = sortedKeys.map((k) => `${k}:${String(headers[k]).trim()}
+`).join("");
+  const signedHeaders = sortedKeys.join(";");
+  const canonicalRequest = [
+    method,
+    canonicalUri,
+    "",
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash
+  ].join("\n");
+  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+  const stringToSign = [
+    "AWS4-HMAC-SHA256",
+    amzDate,
+    credentialScope,
+    sha256Hex(canonicalRequest)
+  ].join("\n");
+  const kDate = hmacSha256(`AWS4${R2_CONFIG.secretAccessKey}`, dateStamp);
+  const kRegion = hmacSha256(kDate, region);
+  const kService = hmacSha256(kRegion, service);
+  const kSigning = hmacSha256(kService, "aws4_request");
+  const signature = hmacSha256(kSigning, stringToSign, "hex");
+  headers["Authorization"] = `AWS4-HMAC-SHA256 Credential=${R2_CONFIG.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+  delete headers.host;
+  return { url, headers };
+}
+async function syncFromR2OnStartup() {
+  if (!isR2Enabled) return;
+  try {
+    const { url, headers } = signR2Request("GET");
+    const res = await fetch(url, {
+      method: "GET",
+      headers,
+      signal: AbortSignal.timeout(5e3)
+    });
+    if (res.status === 404) {
+      console.log("[R2] \u30EA\u30E2\u30FC\u30C8\u306B vault.db \u304C\u672A\u4F5C\u6210\u306E\u305F\u3081\u65B0\u898F\u521D\u671F\u5316\u30E2\u30FC\u30C9\u3067\u8D77\u52D5\u3057\u307E\u3059\u3002");
+      return;
+    }
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+    fs.writeFileSync(DB_FILE, buf);
+    currentETag = res.headers.get("etag");
+    console.log(`[R2] \u540C\u671F\u5B8C\u4E86 (ETag: ${currentETag})`);
+  } catch (err) {
+    isReadOnly = true;
+    console.warn(`[R2] \u63A5\u7D9A\u5931\u6557\u306E\u305F\u3081\u30AA\u30D5\u30E9\u30A4\u30F3\u95B2\u89A7\u5C02\u7528\u30E2\u30FC\u30C9\u3067\u8D77\u52D5\u3057\u307E\u3059: ${err.message}`);
+  }
+}
+async function syncToR2() {
+  if (!isR2Enabled) return;
+  const dbBuffer = fs.readFileSync(DB_FILE);
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const extraHeaders = { "content-type": "application/x-sqlite3" };
+      if (currentETag) extraHeaders["if-match"] = currentETag;
+      const { url, headers } = signR2Request("PUT", dbBuffer, extraHeaders);
+      const res = await fetch(url, {
+        method: "PUT",
+        headers,
+        body: dbBuffer,
+        signal: AbortSignal.timeout(5e3)
+      });
+      if (res.status === 412) {
+        isReadOnly = true;
+        throw new Error(
+          "\u5225\u7AEF\u672B\u3067\u30C7\u30FC\u30BF\u304C\u66F4\u65B0\u3055\u308C\u3066\u3044\u307E\u3059\uFF08ETag\u4E0D\u4E00\u81F4\uFF09\u3002\u5B89\u5168\u306E\u305F\u3081\u95B2\u89A7\u5C02\u7528\u30E2\u30FC\u30C9\u306B\u5207\u308A\u66FF\u3048\u307E\u3057\u305F\u3002\u518D\u8D77\u52D5\u3057\u3066\u304F\u3060\u3055\u3044\u3002"
+        );
+      }
+      if (!res.ok) {
+        throw new Error(`R2\u30A2\u30C3\u30D7\u30ED\u30FC\u30C9\u5931\u6557 (HTTP ${res.status})`);
+      }
+      currentETag = res.headers.get("etag") || currentETag;
+      return;
+    } catch (err) {
+      if (err.message.includes("ETag\u4E0D\u4E00\u81F4") || attempt === 3) {
+        isReadOnly = true;
+        throw err;
+      }
+      await new Promise((r) => setTimeout(r, 1e3 * attempt));
+    }
+  }
+}
+await syncFromR2OnStartup();
 var db = new DatabaseSync(DB_FILE);
 db.exec(`
   PRAGMA secure_delete = ON;
@@ -3617,6 +3738,15 @@ var requireAuth = async (c, next) => {
   c.set("session", s);
   await next();
 };
+var requireWritable = async (c, next) => {
+  if (isReadOnly) {
+    return c.json(
+      { error: "\u73FE\u5728\u30AA\u30D5\u30E9\u30A4\u30F3\uFF08\u95B2\u89A7\u5C02\u7528\u30E2\u30FC\u30C9\uFF09\u306E\u305F\u3081\u5909\u66F4\u3067\u304D\u307E\u305B\u3093\u3002\u30CD\u30C3\u30C8\u30EF\u30FC\u30AF\u3092\u78BA\u8A8D\u3057\u3066\u518D\u8D77\u52D5\u3057\u3066\u304F\u3060\u3055\u3044\u3002" },
+      503
+    );
+  }
+  await next();
+};
 function findIndexHtml() {
   for (const p of [path.join(__dirname, "public", "index.html"), path.join(__dirname, "index.html")]) {
     if (fs.existsSync(p)) return p;
@@ -3628,8 +3758,8 @@ app.get("/", (c) => {
   if (!p) return c.text("index.html \u304C\u898B\u3064\u304B\u308A\u307E\u305B\u3093\uFF08public/index.html \u306B\u7F6E\u3044\u3066\u304F\u3060\u3055\u3044\uFF09\u3002", 500);
   return c.html(fs.readFileSync(p, "utf8"));
 });
-app.get("/api/status", (c) => c.json({ isInitialized: isInitialized() }));
-app.post("/api/setup", async (c) => {
+app.get("/api/status", (c) => c.json({ isInitialized: isInitialized(), readOnly: isReadOnly }));
+app.post("/api/setup", requireWritable, async (c) => {
   if (isInitialized()) {
     return c.json({ error: "\u65E2\u306B\u521D\u671F\u8A2D\u5B9A\u6E08\u307F\u3067\u3059\u3002" }, 409);
   }
@@ -3652,6 +3782,7 @@ app.post("/api/setup", async (c) => {
     db.exec("ROLLBACK");
     throw err;
   }
+  await syncToR2();
   return c.json({ success: true, message: "\u521D\u671F\u8A2D\u5B9A\u304C\u5B8C\u4E86\u3057\u307E\u3057\u305F\u3002" });
 });
 app.post("/api/login", async (c) => {
@@ -3682,7 +3813,7 @@ app.post("/api/logout", requireAuth, (c) => {
 app.get("/api/credentials", requireAuth, (c) => {
   return c.json({ success: true, data: listCredentials(c.get("session").key) });
 });
-app.post("/api/credentials", requireAuth, async (c) => {
+app.post("/api/credentials", requireAuth, requireWritable, async (c) => {
   const body = await readJson(c);
   const { title, url, username, password } = body || {};
   if (!isStr(title, MAX_FIELD_LENGTH) || !title || !isStr(password, MAX_FIELD_LENGTH) || !password) {
@@ -3696,16 +3827,18 @@ app.post("/api/credentials", requireAuth, async (c) => {
     { title, url: url || "", username: username || "", password },
     c.get("session").key
   );
+  await syncToR2();
   return c.json({ success: true, message: "\u65B0\u3057\u3044\u30A2\u30AB\u30A6\u30F3\u30C8\u60C5\u5831\u3092\u767B\u9332\u3057\u307E\u3057\u305F\u3002" });
 });
-app.delete("/api/credentials/:id", requireAuth, (c) => {
+app.delete("/api/credentials/:id", requireAuth, requireWritable, async (c) => {
   const id = Number(c.req.param("id"));
   if (!Number.isInteger(id)) return c.json({ error: "ID\u304C\u4E0D\u6B63\u3067\u3059\u3002" }, 400);
   const r = db.prepare("DELETE FROM credentials WHERE id = ?").run(id);
   if (r.changes === 0) return c.json({ error: "\u5BFE\u8C61\u304C\u898B\u3064\u304B\u308A\u307E\u305B\u3093\u3002" }, 404);
+  await syncToR2();
   return c.json({ success: true });
 });
-app.post("/api/import-csv", requireAuth, async (c) => {
+app.post("/api/import-csv", requireAuth, requireWritable, async (c) => {
   const key = Buffer.from(c.get("session").key);
   try {
     const body = await c.req.parseBody();
@@ -3745,17 +3878,24 @@ app.post("/api/import-csv", requireAuth, async (c) => {
       db.exec("ROLLBACK");
       throw err;
     }
+    await syncToR2();
     return c.json({ success: true, count: rows.length, skipped: totalRows - rows.length });
   } catch (err) {
     console.error("CSV import error:", err.message);
-    return c.json({ error: "CSV\u306E\u8AAD\u307F\u8FBC\u307F\u4E2D\u306B\u30A8\u30E9\u30FC\u304C\u767A\u751F\u3057\u307E\u3057\u305F\u3002" }, 500);
+    return c.json(
+      { error: err.message.includes("ETag\u4E0D\u4E00\u81F4") ? err.message : "CSV\u306E\u8AAD\u307F\u8FBC\u307F\u4E2D\u306B\u30A8\u30E9\u30FC\u304C\u767A\u751F\u3057\u307E\u3057\u305F\u3002" },
+      500
+    );
   } finally {
     key.fill(0);
   }
 });
 app.onError((err, c) => {
   console.error(err);
-  return c.json({ error: "\u30B5\u30FC\u30D0\u30FC\u5185\u90E8\u30A8\u30E9\u30FC\u304C\u767A\u751F\u3057\u307E\u3057\u305F\u3002" }, 500);
+  return c.json(
+    { error: err.message.includes("ETag\u4E0D\u4E00\u81F4") ? err.message : "\u30B5\u30FC\u30D0\u30FC\u5185\u90E8\u30A8\u30E9\u30FC\u304C\u767A\u751F\u3057\u307E\u3057\u305F\u3002" },
+    500
+  );
 });
 function createBackup() {
   if (!isInitialized()) return null;
@@ -3789,6 +3929,13 @@ function shutdown() {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 process.on("SIGHUP", shutdown);
+try {
+  const dest = createBackup();
+  if (dest) console.log(`\u8D77\u52D5\u6642\u30D0\u30C3\u30AF\u30A2\u30C3\u30D7: ${dest}`);
+} catch (err) {
+  console.error("\u8D77\u52D5\u6642\u30D0\u30C3\u30AF\u30A2\u30C3\u30D7\u306B\u5931\u6557\u3057\u307E\u3057\u305F:", err.message);
+}
 serve({ fetch: app.fetch, port: PORT, hostname: HOST }, () => {
-  console.log(`Password Vault server listening on http://localhost:${PORT}`);
+  const modeLabel = !isR2Enabled ? "\u30ED\u30FC\u30AB\u30EB\u5358\u4F53\u30E2\u30FC\u30C9" : isReadOnly ? "\u30AA\u30D5\u30E9\u30A4\u30F3\u95B2\u89A7\u5C02\u7528\u30E2\u30FC\u30C9" : "Cloudflare R2 \u540C\u671F\u30E2\u30FC\u30C9";
+  console.log(`Password Vault server listening on http://localhost:${PORT} [${modeLabel}]`);
 });
