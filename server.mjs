@@ -289,6 +289,7 @@ var require_csv_parser = __commonJS({
 import fs from "node:fs";
 import path from "node:path";
 import crypto2 from "node:crypto";
+import readline from "node:readline/promises";
 import { promisify } from "node:util";
 import { Readable as Readable2 } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -3480,27 +3481,47 @@ var MAX_CSV_BYTES = 5 * 1024 * 1024;
 var KDF = { iterations: 21e4, digest: "sha512" };
 var ALLOWED_HOSTS = /* @__PURE__ */ new Set([`127.0.0.1:${PORT}`, `localhost:${PORT}`]);
 var ALLOWED_ORIGINS = /* @__PURE__ */ new Set([`http://127.0.0.1:${PORT}`, `http://localhost:${PORT}`]);
+var CLI_ARGS = new Set(process.argv.slice(2));
+var IS_CLI_SETUP_R2 = CLI_ARGS.has("--setup-r2");
+var IS_CLI_CLEAR_R2 = CLI_ARGS.has("--clear-r2");
 fs.mkdirSync(BACKUP_DIR, { recursive: true });
 fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
-var R2_CONFIG = {
+var ENV_R2_CONFIG = {
   accountId: process.env.R2_ACCOUNT_ID || "",
   bucket: process.env.R2_BUCKET || "",
   accessKeyId: process.env.R2_ACCESS_KEY_ID || "",
   secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || "",
   key: process.env.R2_OBJECT_KEY || "vault.db"
 };
-var isR2Enabled = !!(R2_CONFIG.accountId && R2_CONFIG.bucket && R2_CONFIG.accessKeyId && R2_CONFIG.secretAccessKey);
+function isValidR2Config(cfg) {
+  return !!(cfg && cfg.accountId && cfg.bucket && cfg.accessKeyId && cfg.secretAccessKey);
+}
+var activeR2Config = isValidR2Config(ENV_R2_CONFIG) ? { ...ENV_R2_CONFIG } : null;
+var r2ConfigSource = activeR2Config ? "env" : "none";
 var currentETag = null;
 var isReadOnly = false;
+var hasPulledFromR2 = false;
+function isR2Enabled() {
+  return isValidR2Config(activeR2Config);
+}
+function clearRuntimeR2Config() {
+  if (r2ConfigSource === "db") {
+    activeR2Config = null;
+    r2ConfigSource = "none";
+    currentETag = null;
+    hasPulledFromR2 = false;
+  }
+}
 function hmacSha256(key, data, encoding) {
   return crypto2.createHmac("sha256", key).update(data).digest(encoding);
 }
 function sha256Hex(data) {
   return crypto2.createHash("sha256").update(data).digest("hex");
 }
-function signR2Request(method, bodyBuffer = null, extraHeaders = {}) {
-  const host = `${R2_CONFIG.accountId}.r2.cloudflarestorage.com`;
-  const canonicalUri = `/${R2_CONFIG.bucket}/${R2_CONFIG.key}`;
+function signR2Request(method, bodyBuffer = null, extraHeaders = {}, cfg = activeR2Config) {
+  const objectKey = cfg.key || "vault.db";
+  const host = `${cfg.accountId}.r2.cloudflarestorage.com`;
+  const canonicalUri = `/${cfg.bucket}/${objectKey}`;
   const url = `https://${host}${canonicalUri}`;
   const now = /* @__PURE__ */ new Date();
   const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
@@ -3533,17 +3554,17 @@ function signR2Request(method, bodyBuffer = null, extraHeaders = {}) {
     credentialScope,
     sha256Hex(canonicalRequest)
   ].join("\n");
-  const kDate = hmacSha256(`AWS4${R2_CONFIG.secretAccessKey}`, dateStamp);
+  const kDate = hmacSha256(`AWS4${cfg.secretAccessKey}`, dateStamp);
   const kRegion = hmacSha256(kDate, region);
   const kService = hmacSha256(kRegion, service);
   const kSigning = hmacSha256(kService, "aws4_request");
   const signature = hmacSha256(kSigning, stringToSign, "hex");
-  headers["Authorization"] = `AWS4-HMAC-SHA256 Credential=${R2_CONFIG.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+  headers["Authorization"] = `AWS4-HMAC-SHA256 Credential=${cfg.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
   delete headers.host;
   return { url, headers };
 }
-async function syncFromR2OnStartup() {
-  if (!isR2Enabled) return;
+async function pullFromR2(reopenDbCallback = null) {
+  if (!isR2Enabled()) return "skipped";
   try {
     const { url, headers } = signR2Request("GET");
     const res = await fetch(url, {
@@ -3552,23 +3573,36 @@ async function syncFromR2OnStartup() {
       signal: AbortSignal.timeout(5e3)
     });
     if (res.status === 404) {
-      console.log("[R2] \u30EA\u30E2\u30FC\u30C8\u306B vault.db \u304C\u672A\u4F5C\u6210\u306E\u305F\u3081\u65B0\u898F\u521D\u671F\u5316\u30E2\u30FC\u30C9\u3067\u8D77\u52D5\u3057\u307E\u3059\u3002");
-      return;
+      hasPulledFromR2 = true;
+      console.log("[R2] \u30EA\u30E2\u30FC\u30C8\u306B vault.db \u304C\u672A\u4F5C\u6210\u306E\u305F\u3081\u30ED\u30FC\u30AB\u30EBDB\u3092\u4F7F\u7528\u3057\u307E\u3059\u3002");
+      return "not_found";
     }
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`);
     }
+    const remoteETag = res.headers.get("etag");
+    if (hasPulledFromR2 && currentETag && remoteETag === currentETag) {
+      return "skipped";
+    }
     const buf = Buffer.from(await res.arrayBuffer());
-    fs.writeFileSync(DB_FILE, buf);
-    currentETag = res.headers.get("etag");
+    if (reopenDbCallback) {
+      reopenDbCallback(buf);
+    } else {
+      fs.writeFileSync(DB_FILE, buf);
+    }
+    currentETag = remoteETag;
+    hasPulledFromR2 = true;
+    isReadOnly = false;
     console.log(`[R2] \u540C\u671F\u5B8C\u4E86 (ETag: ${currentETag})`);
+    return "updated";
   } catch (err) {
     isReadOnly = true;
-    console.warn(`[R2] \u63A5\u7D9A\u5931\u6557\u306E\u305F\u3081\u30AA\u30D5\u30E9\u30A4\u30F3\u95B2\u89A7\u5C02\u7528\u30E2\u30FC\u30C9\u3067\u8D77\u52D5\u3057\u307E\u3059: ${err.message}`);
+    console.warn(`[R2] \u63A5\u7D9A\u5931\u6557\u306E\u305F\u3081\u30AA\u30D5\u30E9\u30A4\u30F3\u95B2\u89A7\u5C02\u7528\u30E2\u30FC\u30C9\u306B\u5207\u308A\u66FF\u3048\u307E\u3059: ${err.message}`);
+    return "offline";
   }
 }
 async function syncToR2() {
-  if (!isR2Enabled) return;
+  if (!isR2Enabled()) return;
   const dbBuffer = fs.readFileSync(DB_FILE);
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
@@ -3601,24 +3635,42 @@ async function syncToR2() {
     }
   }
 }
-await syncFromR2OnStartup();
-var db = new DatabaseSync(DB_FILE);
-db.exec(`
-  PRAGMA secure_delete = ON;
-  CREATE TABLE IF NOT EXISTS system_config (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS credentials (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    iv TEXT NOT NULL,
-    auth_tag TEXT NOT NULL,
-    data TEXT NOT NULL,            -- title/url/username/password \u3092\u307E\u3068\u3081\u3066\u6697\u53F7\u5316\u3057\u305FJSON
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-`);
+if (!IS_CLI_SETUP_R2 && !IS_CLI_CLEAR_R2 && isR2Enabled()) {
+  await pullFromR2();
+}
+var db = null;
+function initDatabaseConnection() {
+  const conn = new DatabaseSync(DB_FILE);
+  conn.exec(`
+    PRAGMA secure_delete = ON;
+    CREATE TABLE IF NOT EXISTS system_config (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS credentials (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      iv TEXT NOT NULL,
+      auth_tag TEXT NOT NULL,
+      data TEXT NOT NULL,            -- title/url/username/password \u3092\u307E\u3068\u3081\u3066\u6697\u53F7\u5316\u3057\u305FJSON
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+  return conn;
+}
+function replaceDatabaseWithBuffer(buf) {
+  if (db) {
+    try {
+      db.close();
+    } catch {
+    }
+  }
+  fs.writeFileSync(DB_FILE, buf);
+  db = initDatabaseConnection();
+}
+db = initDatabaseConnection();
 var getConfig = (key) => db.prepare("SELECT value FROM system_config WHERE key = ?").get(key)?.value ?? null;
 var setConfig = (key, value) => db.prepare("INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)").run(key, value);
+var deleteConfig = (key) => db.prepare("DELETE FROM system_config WHERE key = ?").run(key);
 var isInitialized = () => !!getConfig("password_hash");
 var pbkdf2 = promisify(crypto2.pbkdf2);
 async function deriveKeys(password, saltHex, iterations) {
@@ -3661,6 +3713,135 @@ function decryptRecord(row, key) {
   ]);
   return JSON.parse(plain.toString("utf8"));
 }
+function loadEncryptedR2ConfigFromDb(key) {
+  if (r2ConfigSource === "env" && isR2Enabled()) return true;
+  const raw2 = getConfig("r2_config");
+  if (!raw2) return false;
+  try {
+    const parsedRow = JSON.parse(raw2);
+    const cfg = decryptRecord(
+      {
+        iv: parsedRow.iv,
+        auth_tag: parsedRow.auth_tag ?? parsedRow.authTag,
+        data: parsedRow.data
+      },
+      key
+    );
+    if (isValidR2Config(cfg)) {
+      activeR2Config = {
+        accountId: String(cfg.accountId),
+        bucket: String(cfg.bucket),
+        accessKeyId: String(cfg.accessKeyId),
+        secretAccessKey: String(cfg.secretAccessKey),
+        key: String(cfg.key || "vault.db")
+      };
+      r2ConfigSource = "db";
+      return true;
+    }
+  } catch (err) {
+    console.error("[R2] DB\u5185\u306ER2\u8A2D\u5B9A\u306E\u5FA9\u53F7\u306B\u5931\u6557\u3057\u307E\u3057\u305F:", err.message);
+  }
+  return false;
+}
+function saveEncryptedR2ConfigToDb(cfg, key) {
+  const encrypted = encryptRecord(
+    {
+      accountId: cfg.accountId,
+      bucket: cfg.bucket,
+      accessKeyId: cfg.accessKeyId,
+      secretAccessKey: cfg.secretAccessKey,
+      key: cfg.key || "vault.db"
+    },
+    key
+  );
+  setConfig("r2_config", JSON.stringify(encrypted));
+}
+async function runCliSetupR2() {
+  console.log("=== Cloudflare R2 \u540C\u671F\u8A2D\u5B9A\uFF08\u6697\u53F7\u5316\u4FDD\u5B58CLI\uFF09 ===");
+  if (!isInitialized()) {
+    console.error("\u30A8\u30E9\u30FC: \u5148\u306B\u901A\u5E38\u8D77\u52D5\u3057\u3066\u30D6\u30E9\u30A6\u30B6\u304B\u3089\u30DE\u30B9\u30BF\u30FC\u30D1\u30B9\u30EF\u30FC\u30C9\u306E\u521D\u671F\u8A2D\u5B9A\u3092\u5B8C\u4E86\u3057\u3066\u304F\u3060\u3055\u3044\u3002");
+    process.exit(1);
+  }
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  let encKey = null;
+  try {
+    const masterPassword = await rl.question("\u30DE\u30B9\u30BF\u30FC\u30D1\u30B9\u30EF\u30FC\u30C9\u3092\u5165\u529B: ");
+    encKey = await verifyMasterPassword(masterPassword);
+    if (!encKey) {
+      console.error("\u30A8\u30E9\u30FC: \u30DE\u30B9\u30BF\u30FC\u30D1\u30B9\u30EF\u30FC\u30C9\u304C\u6B63\u3057\u304F\u3042\u308A\u307E\u305B\u3093\u3002");
+      process.exit(1);
+    }
+    const accountId = (await rl.question("R2 Account ID: ")).trim();
+    const bucket = (await rl.question("R2 \u30D0\u30B1\u30C3\u30C8\u540D: ")).trim();
+    const accessKeyId = (await rl.question("R2 Access Key ID: ")).trim();
+    const secretAccessKey = (await rl.question("R2 Secret Access Key: ")).trim();
+    const objectKeyInput = (await rl.question("R2 \u30AA\u30D6\u30B8\u30A7\u30AF\u30C8\u30AD\u30FC [vault.db]: ")).trim();
+    const candidateConfig = {
+      accountId,
+      bucket,
+      accessKeyId,
+      secretAccessKey,
+      key: objectKeyInput || "vault.db"
+    };
+    if (!isValidR2Config(candidateConfig)) {
+      console.error("\u30A8\u30E9\u30FC: \u5FC5\u9808\u9805\u76EE\u304C\u4E0D\u8DB3\u3057\u3066\u3044\u307E\u3059\u3002\u51E6\u7406\u3092\u4E2D\u65AD\u3057\u307E\u3057\u305F\u3002");
+      process.exit(1);
+    }
+    process.stdout.write("R2\u3078\u306E\u63A5\u7D9A\u30C6\u30B9\u30C8\u3092\u5B9F\u884C\u4E2D... ");
+    const { url, headers } = signR2Request("HEAD", null, {}, candidateConfig);
+    const res = await fetch(url, {
+      method: "HEAD",
+      headers,
+      signal: AbortSignal.timeout(5e3)
+    });
+    if (res.status !== 200 && res.status !== 404) {
+      console.log("\u5931\u6557");
+      console.error(`\u30A8\u30E9\u30FC: R2\u3078\u306E\u63A5\u7D9A\u306B\u5931\u6557\u3057\u307E\u3057\u305F\uFF08HTTP ${res.status}\uFF09\u3002\u30AD\u30FC\u307E\u305F\u306F\u30D0\u30B1\u30C3\u30C8\u540D\u3092\u78BA\u8A8D\u3057\u3066\u304F\u3060\u3055\u3044\u3002`);
+      process.exit(1);
+    }
+    console.log("OK");
+    saveEncryptedR2ConfigToDb(candidateConfig, encKey);
+    console.log("R2\u8A2D\u5B9A\u3092\u30DE\u30B9\u30BF\u30FC\u9375\u3067\u6697\u53F7\u5316\u3057\u3001vault.db (system_config) \u306B\u4FDD\u5B58\u3057\u307E\u3057\u305F\u3002");
+    if (res.status === 404) {
+      process.stdout.write("\u30EA\u30E2\u30FC\u30C8\u306B\u672A\u4F5C\u6210\u306E\u305F\u3081\u3001\u73FE\u5728\u306EDB\u3092R2\u3078\u521D\u56DE\u30A2\u30C3\u30D7\u30ED\u30FC\u30C9\u4E2D... ");
+      activeR2Config = candidateConfig;
+      r2ConfigSource = "db";
+      await syncToR2();
+      console.log("\u5B8C\u4E86");
+    } else {
+      console.log("\u30EA\u30E2\u30FC\u30C8\u306B\u65E2\u5B58\u306E vault.db \u304C\u898B\u3064\u304B\u308A\u307E\u3057\u305F\u3002\u6B21\u56DE\u901A\u5E38\u8D77\u52D5\u30FB\u30ED\u30B0\u30A4\u30F3\u6642\u306B\u81EA\u52D5\u540C\u671F\u3055\u308C\u307E\u3059\u3002");
+    }
+    console.log("\u203B\u8D77\u52D5\u30B9\u30AF\u30EA\u30D7\u30C8\uFF08.bat / .sh\uFF09\u304B\u3089 R2_ \u95A2\u9023\u306E\u74B0\u5883\u5909\u6570\u306F\u524A\u9664\u3057\u3066\u554F\u984C\u3042\u308A\u307E\u305B\u3093\u3002");
+  } finally {
+    rl.close();
+    if (encKey) encKey.fill(0);
+    try {
+      db.close();
+    } catch {
+    }
+  }
+  process.exit(0);
+}
+function runCliClearR2() {
+  const existing = getConfig("r2_config");
+  if (!existing) {
+    console.log("DB\u5185\u306B\u6697\u53F7\u5316\u3055\u308C\u305FR2\u8A2D\u5B9A\u306F\u4FDD\u5B58\u3055\u308C\u3066\u3044\u307E\u305B\u3093\u3002");
+  } else {
+    deleteConfig("r2_config");
+    console.log("vault.db (system_config) \u304B\u3089R2\u8A2D\u5B9A\u3092\u524A\u9664\u3057\u307E\u3057\u305F\u3002");
+  }
+  try {
+    db.close();
+  } catch {
+  }
+  process.exit(0);
+}
+if (IS_CLI_SETUP_R2) {
+  await runCliSetupR2();
+}
+if (IS_CLI_CLEAR_R2) {
+  runCliClearR2();
+}
 var insertStmt = () => db.prepare("INSERT INTO credentials (iv, auth_tag, data) VALUES (?, ?, ?)");
 function insertCredential(stmt, record, key) {
   const { iv, authTag, data } = encryptRecord(record, key);
@@ -3687,6 +3868,9 @@ function destroySession(token) {
   if (s) {
     s.key.fill(0);
     sessions.delete(token);
+  }
+  if (sessions.size === 0) {
+    clearRuntimeR2Config();
   }
 }
 function getSession(c) {
@@ -3758,7 +3942,16 @@ app.get("/", (c) => {
   if (!p) return c.text("index.html \u304C\u898B\u3064\u304B\u308A\u307E\u305B\u3093\uFF08public/index.html \u306B\u7F6E\u3044\u3066\u304F\u3060\u3055\u3044\uFF09\u3002", 500);
   return c.html(fs.readFileSync(p, "utf8"));
 });
-app.get("/api/status", (c) => c.json({ isInitialized: isInitialized(), readOnly: isReadOnly }));
+app.get(
+  "/api/status",
+  (c) => c.json({
+    isInitialized: isInitialized(),
+    readOnly: isReadOnly,
+    r2Enabled: isR2Enabled(),
+    r2HasSavedConfig: !!getConfig("r2_config"),
+    r2Source: r2ConfigSource
+  })
+);
 app.post("/api/setup", requireWritable, async (c) => {
   if (isInitialized()) {
     return c.json({ error: "\u65E2\u306B\u521D\u671F\u8A2D\u5B9A\u6E08\u307F\u3067\u3059\u3002" }, 409);
@@ -3796,15 +3989,34 @@ app.post("/api/login", async (c) => {
     return c.json({ error: "\u30DE\u30B9\u30BF\u30FC\u30D1\u30B9\u30EF\u30FC\u30C9\u3092\u5165\u529B\u3057\u3066\u304F\u3060\u3055\u3044\u3002" }, 400);
   }
   if (!isInitialized()) return c.json({ error: "\u521D\u671F\u8A2D\u5B9A\u304C\u5B8C\u4E86\u3057\u3066\u3044\u307E\u305B\u3093\u3002" }, 400);
-  const key = await verifyMasterPassword(body.masterPassword);
+  let key = await verifyMasterPassword(body.masterPassword);
   if (!key) {
     failCount++;
     if (failCount >= 5) lockedUntil = Date.now() + Math.min(1e3 * 2 ** (failCount - 5), 5 * 60 * 1e3);
     return c.json({ error: "\u30DE\u30B9\u30BF\u30FC\u30D1\u30B9\u30EF\u30FC\u30C9\u304C\u6B63\u3057\u304F\u3042\u308A\u307E\u305B\u3093\u3002" }, 401);
   }
+  const loadedFromDb = loadEncryptedR2ConfigFromDb(key);
+  if (loadedFromDb && !hasPulledFromR2) {
+    const pullResult = await pullFromR2(replaceDatabaseWithBuffer);
+    if (pullResult === "updated") {
+      key.fill(0);
+      key = await verifyMasterPassword(body.masterPassword);
+      if (!key) {
+        clearRuntimeR2Config();
+        return c.json({ error: "\u540C\u671F\u3055\u308C\u305FR2\u30C7\u30FC\u30BF\u30D9\u30FC\u30B9\u306E\u30DE\u30B9\u30BF\u30FC\u30D1\u30B9\u30EF\u30FC\u30C9\u304C\u4E00\u81F4\u3057\u307E\u305B\u3093\u3002" }, 401);
+      }
+      loadEncryptedR2ConfigFromDb(key);
+    }
+  }
   failCount = 0;
   lockedUntil = 0;
-  return c.json({ success: true, token: createSession(key), ttlSeconds: SESSION_TTL_MS / 1e3 });
+  return c.json({
+    success: true,
+    token: createSession(key),
+    ttlSeconds: SESSION_TTL_MS / 1e3,
+    readOnly: isReadOnly,
+    r2Enabled: isR2Enabled()
+  });
 });
 app.post("/api/logout", requireAuth, (c) => {
   destroySession(c.get("session").token);
@@ -3920,6 +4132,7 @@ function shutdown() {
     console.error("\u30D0\u30C3\u30AF\u30A2\u30C3\u30D7\u4E2D\u306B\u30A8\u30E9\u30FC\u304C\u767A\u751F\u3057\u307E\u3057\u305F:", err);
   }
   for (const token of [...sessions.keys()]) destroySession(token);
+  clearRuntimeR2Config();
   try {
     db.close();
   } catch {
@@ -3936,6 +4149,6 @@ try {
   console.error("\u8D77\u52D5\u6642\u30D0\u30C3\u30AF\u30A2\u30C3\u30D7\u306B\u5931\u6557\u3057\u307E\u3057\u305F:", err.message);
 }
 serve({ fetch: app.fetch, port: PORT, hostname: HOST }, () => {
-  const modeLabel = !isR2Enabled ? "\u30ED\u30FC\u30AB\u30EB\u5358\u4F53\u30E2\u30FC\u30C9" : isReadOnly ? "\u30AA\u30D5\u30E9\u30A4\u30F3\u95B2\u89A7\u5C02\u7528\u30E2\u30FC\u30C9" : "Cloudflare R2 \u540C\u671F\u30E2\u30FC\u30C9";
+  const modeLabel = isR2Enabled() ? isReadOnly ? "\u30AA\u30D5\u30E9\u30A4\u30F3\u95B2\u89A7\u5C02\u7528\u30E2\u30FC\u30C9 (\u74B0\u5883\u5909\u6570)" : "Cloudflare R2 \u540C\u671F\u30E2\u30FC\u30C9 (\u74B0\u5883\u5909\u6570)" : getConfig("r2_config") ? "Cloudflare R2 \u540C\u671F\u5F85\u6A5F\u30E2\u30FC\u30C9 (\u30ED\u30B0\u30A4\u30F3\u5F8C\u306B\u6709\u52B9\u5316)" : "\u30ED\u30FC\u30AB\u30EB\u5358\u4F53\u30E2\u30FC\u30C9";
   console.log(`Password Vault server listening on http://localhost:${PORT} [${modeLabel}]`);
 });
